@@ -18,6 +18,8 @@ type Router interface {
 	VisibilityTimeout(ctx context.Context) int32
 	RunMode(ctx context.Context) Mode
 	CustomGroupFields(ctx context.Context) []string
+	// Close flushes any pending batched operations (e.g. deletes) on graceful shutdown.
+	Close(ctx context.Context) error
 }
 
 // SQSClient represents the aws sqs client methods
@@ -26,9 +28,17 @@ type SQSClient interface {
 		ctx context.Context,
 		params *sqs.ChangeMessageVisibilityInput,
 		optFns ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error)
+	ChangeMessageVisibilityBatch(
+		ctx context.Context,
+		params *sqs.ChangeMessageVisibilityBatchInput,
+		optFns ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityBatchOutput, error)
 	GetQueueUrl(ctx context.Context, params *sqs.GetQueueUrlInput, optFns ...func(*sqs.Options)) (*sqs.GetQueueUrlOutput, error)
 	ReceiveMessage(ctx context.Context, params *sqs.ReceiveMessageInput, optFns ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error)
 	DeleteMessage(ctx context.Context, params *sqs.DeleteMessageInput, optFns ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error)
+	DeleteMessageBatch(
+		ctx context.Context,
+		params *sqs.DeleteMessageBatchInput,
+		optFns ...func(*sqs.Options)) (*sqs.DeleteMessageBatchOutput, error)
 }
 
 // Message represents the message interface methods

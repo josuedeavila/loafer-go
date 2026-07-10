@@ -19,6 +19,7 @@ func BenchmarkManager_Run(b *testing.B) {
 	message := new(fake.Message)
 	router := new(fake.Router)
 	router.On("Configure", mock.Anything).Return(nil)
+	router.On("Close", mock.Anything).Return(nil)
 	router.On("WorkerPoolSize", mock.Anything).Return(int32(4))
 	router.On("RunMode", mock.Anything).Return(loafergo.Parallel)
 	router.On("GetMessages", mock.Anything).Return([]loafergo.Message{message}, nil).Maybe()

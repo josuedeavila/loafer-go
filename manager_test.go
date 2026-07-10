@@ -51,6 +51,7 @@ func TestManager_Run_StandardMessages(t *testing.T) {
 	logger.On("Log", mock.Anything).Return()
 
 	router.On("Configure", mock.Anything).Return(nil)
+	router.On("Close", mock.Anything).Return(nil)
 	router.On("WorkerPoolSize", mock.Anything).Return(int32(1))
 	router.On("RunMode", mock.Anything).Return(loafergo.Parallel)
 	router.On("GetMessages", mock.Anything, logger).Return([]loafergo.Message{message}, nil).Once()
@@ -89,6 +90,7 @@ func TestManager_Run_FIFO_With_GroupKey(t *testing.T) {
 
 	router := new(fake.Router)
 	router.On("Configure", mock.Anything).Return(nil)
+	router.On("Close", mock.Anything).Return(nil)
 	router.On("WorkerPoolSize", mock.Anything).Return(int32(1))
 	router.On("RunMode", mock.Anything).Return(loafergo.PerGroupID)
 	router.On("CustomGroupFields", mock.Anything).Return([]string{"seller_id"})
@@ -142,6 +144,7 @@ func TestManager_Run_HandlerMessageError(t *testing.T) {
 
 	router := new(fake.Router)
 	router.On("Configure", mock.Anything).Return(nil)
+	router.On("Close", mock.Anything).Return(nil)
 	router.On("WorkerPoolSize", mock.Anything).Return(int32(1))
 	router.On("RunMode", mock.Anything).Return(loafergo.Parallel).Maybe()
 	router.On("GetMessages", mock.Anything, logger).Return([]loafergo.Message{message}, nil).Once()
@@ -178,6 +181,7 @@ func TestManager_Run_CommitError(t *testing.T) {
 
 	router := new(fake.Router)
 	router.On("Configure", mock.Anything).Return(nil)
+	router.On("Close", mock.Anything).Return(nil)
 	router.On("WorkerPoolSize", mock.Anything).Return(int32(1))
 	router.On("RunMode", mock.Anything).Return(loafergo.Parallel)
 	router.On("GetMessages", mock.Anything, logger).Return([]loafergo.Message{message}, nil).Once()
@@ -213,6 +217,7 @@ func TestManager_Run_GetMessagesTemporaryError(t *testing.T) {
 
 	router := new(fake.Router)
 	router.On("Configure", mock.Anything).Return(nil)
+	router.On("Close", mock.Anything).Return(nil)
 	router.On("WorkerPoolSize", mock.Anything).Return(int32(1))
 	router.On("RunMode", mock.Anything).Return(loafergo.Parallel).Maybe()
 	router.On("GetMessages", mock.Anything, logger).Return(nil, errors.New("temporary error")).Once()

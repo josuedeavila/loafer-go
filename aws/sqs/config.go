@@ -2,6 +2,7 @@ package sqs
 
 import (
 	"strconv"
+	"time"
 
 	loafergo "github.com/justcodes/loafer-go/v2"
 )
@@ -14,32 +15,49 @@ type Config struct {
 }
 
 const (
-	defaultExtensionLimit    = 2
-	defaultVisibilityTimeout = int32(30)
-	defaultMaxMessages       = int32(10)
-	defaultWaitTimeSeconds   = int32(10)
-	defaultWorkerPoolSize    = int32(5)
+	defaultExtensionLimit          = 2
+	defaultVisibilityTimeout       = int32(30)
+	defaultMaxMessages             = int32(10)
+	defaultWaitTimeSeconds         = int32(10)
+	defaultWorkerPoolSize          = int32(5)
+	defaultDeleteBatchSize         = 10
+	defaultDeleteBatchInterval     = 200 * time.Millisecond
+	defaultVisibilityBatchSize     = 10
+	defaultVisibilityBatchInterval = 500 * time.Millisecond
+	maxBatchSize                   = 10
 )
 
 // RouteConfig are a discrete set of route options that are valid for loading the route configuration
 type RouteConfig struct {
-	customGroupFields []string
-	extensionLimit    int
-	runMode           loafergo.Mode
-	visibilityTimeout int32
-	maxMessages       int32
-	waitTimeSeconds   int32
-	workerPoolSize    int32
+	customGroupFields       []string
+	deleteBatchSize         int
+	extensionLimit          int
+	runMode                 loafergo.Mode
+	visibilityBatchInterval time.Duration
+	visibilityBatchSize     int
+	deleteBatchInterval     time.Duration
+	visibilityTimeout       int32
+	workerPoolSize          int32
+	waitTimeSeconds         int32
+	maxMessages             int32
+	batchDeleteEnabled      bool
+	batchVisibilityEnabled  bool
 }
 
 func loadDefaultRouteConfig() *RouteConfig {
 	return &RouteConfig{
-		visibilityTimeout: defaultVisibilityTimeout,
-		maxMessages:       defaultMaxMessages,
-		extensionLimit:    defaultExtensionLimit,
-		waitTimeSeconds:   defaultWaitTimeSeconds,
-		workerPoolSize:    defaultWorkerPoolSize,
-		runMode:           loafergo.Parallel,
+		visibilityTimeout:       defaultVisibilityTimeout,
+		maxMessages:             defaultMaxMessages,
+		extensionLimit:          defaultExtensionLimit,
+		waitTimeSeconds:         defaultWaitTimeSeconds,
+		workerPoolSize:          defaultWorkerPoolSize,
+		runMode:                 loafergo.Parallel,
+		batchDeleteEnabled:      false,
+		deleteBatchSize:         defaultDeleteBatchSize,
+		deleteBatchInterval:     defaultDeleteBatchInterval,
+		batchVisibilityEnabled:  false,
+		visibilityBatchSize:     defaultVisibilityBatchSize,
+		visibilityBatchInterval: defaultVisibilityBatchInterval,
 	}
 }
 
@@ -143,6 +161,66 @@ func RouteWithRunMode(v loafergo.Mode) LoadRouteConfigFunc {
 func RouteWithCustomGroupFields(v []string) LoadRouteConfigFunc {
 	return func(rc *RouteConfig) {
 		rc.customGroupFields = v
+	}
+}
+
+// RouteWithDeleteBatching enables batching of DeleteMessage calls (Commit) using
+// DeleteMessageBatch, reducing the number of SQS API requests at high throughput.
+// Disabled by default; when enabled, use RouteWithDeleteBatchSize and
+// RouteWithDeleteBatchInterval to tune the batching window.
+func RouteWithDeleteBatching(enabled bool) LoadRouteConfigFunc {
+	return func(rc *RouteConfig) {
+		rc.batchDeleteEnabled = enabled
+	}
+}
+
+// RouteWithDeleteBatchSize sets the maximum number of entries per DeleteMessageBatch
+// request. Values above the SQS hard limit (10) are clamped to 10.
+func RouteWithDeleteBatchSize(v int) LoadRouteConfigFunc {
+	return func(rc *RouteConfig) {
+		if v <= 0 || v > maxBatchSize {
+			v = maxBatchSize
+		}
+		rc.deleteBatchSize = v
+	}
+}
+
+// RouteWithDeleteBatchInterval sets the maximum time a delete request waits for its
+// batch to fill up before being flushed on its own.
+func RouteWithDeleteBatchInterval(d time.Duration) LoadRouteConfigFunc {
+	return func(rc *RouteConfig) {
+		rc.deleteBatchInterval = d
+	}
+}
+
+// RouteWithVisibilityBatching enables batching of ChangeMessageVisibility calls using
+// ChangeMessageVisibilityBatch, reducing the number of SQS API requests for routes
+// with many long-running or backed-off messages in flight.
+// Disabled by default; when enabled, use RouteWithVisibilityBatchSize and
+// RouteWithVisibilityBatchInterval to tune the batching window.
+func RouteWithVisibilityBatching(enabled bool) LoadRouteConfigFunc {
+	return func(rc *RouteConfig) {
+		rc.batchVisibilityEnabled = enabled
+	}
+}
+
+// RouteWithVisibilityBatchSize sets the maximum number of entries per
+// ChangeMessageVisibilityBatch request. Values above the SQS hard limit (10) are
+// clamped to 10.
+func RouteWithVisibilityBatchSize(v int) LoadRouteConfigFunc {
+	return func(rc *RouteConfig) {
+		if v <= 0 || v > maxBatchSize {
+			v = maxBatchSize
+		}
+		rc.visibilityBatchSize = v
+	}
+}
+
+// RouteWithVisibilityBatchInterval sets how often the visibility scheduler groups
+// due extensions into a batch request.
+func RouteWithVisibilityBatchInterval(d time.Duration) LoadRouteConfigFunc {
+	return func(rc *RouteConfig) {
+		rc.visibilityBatchInterval = d
 	}
 }
 

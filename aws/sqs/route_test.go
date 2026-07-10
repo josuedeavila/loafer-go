@@ -3,6 +3,7 @@ package sqs_test
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -298,6 +299,142 @@ func (suite *routeSuite) TestCommit() {
 		err = suite.route.Commit(ctx, message[0])
 		suite.NotNil(err)
 		suite.Equal("got error", err.Error())
+	})
+}
+
+func (suite *routeSuite) TestCommitWithDeleteBatching() {
+	logger := new(fake.Logger)
+	logger.On("Log", mock.Anything).Return()
+
+	suite.Run("Should batch two commits into a single DeleteMessageBatch call", func() {
+		suite.route = suite.setupRouter(
+			sqs.RouteWithDeleteBatching(true),
+			sqs.RouteWithDeleteBatchSize(2),
+			sqs.RouteWithDeleteBatchInterval(time.Hour),
+		)
+		ctx, done := setupContext(2)
+		cParam := &awsSqs.GetQueueUrlInput{QueueName: aws.String("example-1")}
+		suite.sqsClient.On("GetQueueUrl", ctx, cParam).
+			Return(&awsSqs.GetQueueUrlOutput{QueueUrl: aws.String("example-1-url")}, nil).
+			Once()
+
+		err := suite.route.Configure(ctx)
+		suite.NoError(err)
+
+		param := &awsSqs.ReceiveMessageInput{
+			QueueUrl:                    aws.String("example-1-url"),
+			WaitTimeSeconds:             8,
+			MaxNumberOfMessages:         15,
+			MessageAttributeNames:       []string{"All"},
+			MessageSystemAttributeNames: []types.MessageSystemAttributeName{types.MessageSystemAttributeNameAll},
+		}
+		suite.sqsClient.On("ReceiveMessage", ctx, param).
+			Return(&awsSqs.ReceiveMessageOutput{
+				Messages: []types.Message{
+					{Body: aws.String("hello world 1"), ReceiptHandle: aws.String("receipt-handle-1")},
+					{Body: aws.String("hello world 2"), ReceiptHandle: aws.String("receipt-handle-2")},
+				},
+			}, nil).
+			Once()
+
+		suite.sqsClient.On("ChangeMessageVisibility", ctx, mock.Anything).
+			Return(nil, nil).
+			Twice()
+
+		messages, err := suite.route.GetMessages(ctx, logger)
+		suite.NoError(err)
+		<-done
+		<-done
+
+		suite.sqsClient.On("DeleteMessageBatch", ctx, mock.MatchedBy(func(in *awsSqs.DeleteMessageBatchInput) bool {
+			return in.QueueUrl != nil && *in.QueueUrl == "example-1-url" && len(in.Entries) == 2
+		})).
+			Return(func(_ context.Context, in *awsSqs.DeleteMessageBatchInput, _ ...func(*awsSqs.Options)) (*awsSqs.DeleteMessageBatchOutput, error) {
+				out := &awsSqs.DeleteMessageBatchOutput{}
+				for _, e := range in.Entries {
+					out.Successful = append(out.Successful, types.DeleteMessageBatchResultEntry{Id: e.Id})
+				}
+				return out, nil
+			}, nil).
+			Once()
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		var err1, err2 error
+		go func() {
+			defer wg.Done()
+			err1 = suite.route.Commit(ctx, messages[0])
+		}()
+		go func() {
+			defer wg.Done()
+			err2 = suite.route.Commit(ctx, messages[1])
+		}()
+		wg.Wait()
+
+		suite.NoError(err1)
+		suite.NoError(err2)
+	})
+}
+
+func (suite *routeSuite) TestChangeVisibilityBatching() {
+	logger := new(fake.Logger)
+	logger.On("Log", mock.Anything).Return()
+
+	suite.Run("Should extend visibility via ChangeMessageVisibilityBatch and stop on commit", func() {
+		suite.route = suite.setupRouter(
+			sqs.RouteWithVisibilityBatching(true),
+			sqs.RouteWithVisibilityBatchInterval(20*time.Millisecond),
+			sqs.RouteWithVisibilityBatchSize(10),
+			sqs.RouteWithVisibilityTimeout(11),
+		)
+		ctx, done := setupContext(1)
+		cParam := &awsSqs.GetQueueUrlInput{QueueName: aws.String("example-1")}
+		suite.sqsClient.On("GetQueueUrl", ctx, cParam).
+			Return(&awsSqs.GetQueueUrlOutput{QueueUrl: aws.String("example-1-url")}, nil).
+			Once()
+
+		err := suite.route.Configure(ctx)
+		suite.NoError(err)
+
+		param := &awsSqs.ReceiveMessageInput{
+			QueueUrl:                    aws.String("example-1-url"),
+			WaitTimeSeconds:             8,
+			MaxNumberOfMessages:         15,
+			MessageAttributeNames:       []string{"All"},
+			MessageSystemAttributeNames: []types.MessageSystemAttributeName{types.MessageSystemAttributeNameAll},
+		}
+		suite.sqsClient.On("ReceiveMessage", ctx, param).
+			Return(&awsSqs.ReceiveMessageOutput{
+				Messages: []types.Message{
+					{Body: aws.String("hello world"), ReceiptHandle: aws.String("receipt-handle")},
+				},
+			}, nil).
+			Once()
+
+		suite.sqsClient.On("ChangeMessageVisibilityBatch", ctx, mock.MatchedBy(func(in *awsSqs.ChangeMessageVisibilityBatchInput) bool {
+			return in.QueueUrl != nil && *in.QueueUrl == "example-1-url" && len(in.Entries) == 1
+		})).
+			Return(func(_ context.Context, in *awsSqs.ChangeMessageVisibilityBatchInput, _ ...func(*awsSqs.Options)) (*awsSqs.ChangeMessageVisibilityBatchOutput, error) {
+				out := &awsSqs.ChangeMessageVisibilityBatchOutput{}
+				for _, e := range in.Entries {
+					out.Successful = append(out.Successful, types.ChangeMessageVisibilityBatchResultEntry{Id: e.Id})
+				}
+				return out, nil
+			}, nil)
+
+		messages, err := suite.route.GetMessages(ctx, logger)
+		suite.NoError(err)
+
+		// wait for the scheduler's first tick to flush the initial extension
+		<-done
+
+		suite.sqsClient.On("DeleteMessage", ctx, &awsSqs.DeleteMessageInput{
+			QueueUrl:      aws.String("example-1-url"),
+			ReceiptHandle: aws.String("receipt-handle"),
+		}).Return(nil, nil).Once()
+
+		err = suite.route.Commit(ctx, messages[0])
+		suite.Nil(err)
 	})
 }
 

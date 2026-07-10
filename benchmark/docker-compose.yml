@@ -1,0 +1,16 @@
+volumes:
+  localstack-bench:
+
+services:
+  localstack:
+    container_name: "loafer-benchmark-localstack"
+    image: localstack/localstack
+    ports:
+      - "127.0.0.1:4566:4566"
+      - "127.0.0.1:4510-4559:4510-4559"
+    environment:
+      - DEBUG=${DEBUG-}
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - AWS_DEFAULT_REGION=us-east-1
+    volumes:
+      - "./init/create-queues.sh:/etc/localstack/init/ready.d/create-queues.sh"

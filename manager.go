@@ -79,6 +79,9 @@ func (m *Manager) runRoute(ctx context.Context, r Router) {
 		for _, ch := range messageChs {
 			close(ch)
 		}
+		if err := r.Close(context.WithoutCancel(ctx)); err != nil {
+			m.config.Logger.Log(fmt.Sprintf("route_close_error: %v", err))
+		}
 	}()
 
 	m.config.Logger.Log("Route consumer ready...")
