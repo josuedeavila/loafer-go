@@ -119,7 +119,7 @@ func (suite *routeSuite) TestGetMessages() {
 
 	suite.Run("Should return the messages", func() {
 		suite.route = suite.setupRouter()
-		ctx, done := setupContext(1)
+		ctx := context.Background()
 		cParam := &awsSqs.GetQueueUrlInput{QueueName: aws.String("example-1")}
 		suite.sqsClient.On("GetQueueUrl", ctx, cParam).
 			Return(&awsSqs.GetQueueUrlOutput{QueueUrl: aws.String("example-1-url")}, nil).
@@ -131,6 +131,7 @@ func (suite *routeSuite) TestGetMessages() {
 			QueueUrl:                    aws.String("example-1-url"),
 			WaitTimeSeconds:             8,
 			MaxNumberOfMessages:         15,
+			VisibilityTimeout:           12,
 			MessageAttributeNames:       []string{"All"},
 			MessageSystemAttributeNames: []types.MessageSystemAttributeName{types.MessageSystemAttributeNameAll},
 		}
@@ -143,24 +144,26 @@ func (suite *routeSuite) TestGetMessages() {
 			}, nil).
 			Once()
 
-		suite.sqsClient.On("ChangeMessageVisibility", ctx, &awsSqs.ChangeMessageVisibilityInput{
-			QueueUrl:          aws.String("example-1-url"),
-			ReceiptHandle:     aws.String("receipt-handle"),
-			VisibilityTimeout: int32(12),
-		}).Return(nil, nil).Once()
-
+		// No ChangeMessageVisibility call is expected: it is only made if the message
+		// is still being processed once the visibility timeout is close to expiring.
 		messages, err := suite.route.GetMessages(ctx, logger)
 		suite.NoError(err)
-		<-done
 
 		suite.Len(messages, 1)
 		suite.Equal("hello world", string(messages[0].Body()))
 
+		// commit to dispatch the message, otherwise its changeMessageVisibility
+		// goroutine keeps ticking in the background for the rest of the test run.
+		suite.sqsClient.On("DeleteMessage", ctx, &awsSqs.DeleteMessageInput{
+			QueueUrl:      aws.String("example-1-url"),
+			ReceiptHandle: aws.String("receipt-handle"),
+		}).Return(nil, nil).Once()
+		suite.NoError(suite.route.Commit(ctx, messages[0]))
 	})
 
 	suite.Run("Should return error when receive message", func() {
 		suite.route = suite.setupRouter()
-		ctx, done := setupContext(1)
+		ctx := context.Background()
 		cParam := &awsSqs.GetQueueUrlInput{QueueName: aws.String("example-1")}
 		suite.sqsClient.On("GetQueueUrl", ctx, cParam).
 			Return(&awsSqs.GetQueueUrlOutput{QueueUrl: aws.String("example-1-url")}, nil).
@@ -172,6 +175,7 @@ func (suite *routeSuite) TestGetMessages() {
 			QueueUrl:                    aws.String("example-1-url"),
 			WaitTimeSeconds:             8,
 			MaxNumberOfMessages:         15,
+			VisibilityTimeout:           12,
 			MessageAttributeNames:       []string{"All"},
 			MessageSystemAttributeNames: []types.MessageSystemAttributeName{types.MessageSystemAttributeNameAll},
 		}
@@ -179,7 +183,6 @@ func (suite *routeSuite) TestGetMessages() {
 			Return(nil, fmt.Errorf("got error")).
 			Once()
 
-		done <- true // wont call change message visibility
 		messages, err := suite.route.GetMessages(ctx, logger)
 		suite.NotNil(err)
 
@@ -203,7 +206,7 @@ func (suite *routeSuite) TestCommit() {
 
 	suite.Run("Should commit commit", func() {
 		suite.route = suite.setupRouter()
-		ctx, done := setupContext(1)
+		ctx := context.Background()
 		cParam := &awsSqs.GetQueueUrlInput{QueueName: aws.String("example-1")}
 		suite.sqsClient.On("GetQueueUrl", ctx, cParam).
 			Return(&awsSqs.GetQueueUrlOutput{QueueUrl: aws.String("example-1-url")}, nil).
@@ -215,6 +218,7 @@ func (suite *routeSuite) TestCommit() {
 			QueueUrl:                    aws.String("example-1-url"),
 			WaitTimeSeconds:             8,
 			MaxNumberOfMessages:         15,
+			VisibilityTimeout:           12,
 			MessageAttributeNames:       []string{"All"},
 			MessageSystemAttributeNames: []types.MessageSystemAttributeName{types.MessageSystemAttributeNameAll},
 		}
@@ -227,16 +231,9 @@ func (suite *routeSuite) TestCommit() {
 			}, nil).
 			Once()
 
-		suite.sqsClient.On("ChangeMessageVisibility", ctx, &awsSqs.ChangeMessageVisibilityInput{
-			QueueUrl:          aws.String("example-1-url"),
-			ReceiptHandle:     aws.String("receipt-handle"),
-			VisibilityTimeout: int32(12),
-		}).Return(nil, nil).Once()
-
+		// message is committed right away, so no ChangeMessageVisibility call is expected
 		message, err := suite.route.GetMessages(ctx, logger)
 		suite.NoError(err)
-
-		<-done
 
 		commitParam := &awsSqs.DeleteMessageInput{
 			QueueUrl:      aws.String("example-1-url"),
@@ -252,7 +249,7 @@ func (suite *routeSuite) TestCommit() {
 
 	suite.Run("Should return error when commit error", func() {
 		suite.route = suite.setupRouter()
-		ctx, done := setupContext(1)
+		ctx := context.Background()
 		cParam := &awsSqs.GetQueueUrlInput{QueueName: aws.String("example-1")}
 		suite.sqsClient.On("GetQueueUrl", ctx, cParam).
 			Return(&awsSqs.GetQueueUrlOutput{QueueUrl: aws.String("example-1-url")}, nil).
@@ -264,6 +261,7 @@ func (suite *routeSuite) TestCommit() {
 			QueueUrl:                    aws.String("example-1-url"),
 			WaitTimeSeconds:             8,
 			MaxNumberOfMessages:         15,
+			VisibilityTimeout:           12,
 			MessageAttributeNames:       []string{"All"},
 			MessageSystemAttributeNames: []types.MessageSystemAttributeName{types.MessageSystemAttributeNameAll},
 		}
@@ -276,16 +274,8 @@ func (suite *routeSuite) TestCommit() {
 			}, nil).
 			Once()
 
-		suite.sqsClient.On("ChangeMessageVisibility", ctx, &awsSqs.ChangeMessageVisibilityInput{
-			QueueUrl:          aws.String("example-1-url"),
-			ReceiptHandle:     aws.String("receipt-handle"),
-			VisibilityTimeout: int32(12),
-		}).Return(nil, nil).Once()
-
 		message, err := suite.route.GetMessages(ctx, logger)
 		suite.NoError(err)
-
-		<-done
 
 		commitParam := &awsSqs.DeleteMessageInput{
 			QueueUrl:      aws.String("example-1-url"),
@@ -307,7 +297,7 @@ func (suite *routeSuite) TestHandlerMessage() {
 
 	suite.Run("should handler message", func() {
 		suite.route = suite.setupRouter()
-		ctx, done := setupContext(1)
+		ctx := context.Background()
 		cParam := &awsSqs.GetQueueUrlInput{QueueName: aws.String("example-1")}
 		suite.sqsClient.On("GetQueueUrl", ctx, cParam).
 			Return(&awsSqs.GetQueueUrlOutput{QueueUrl: aws.String("example-1-url")}, nil).
@@ -319,6 +309,7 @@ func (suite *routeSuite) TestHandlerMessage() {
 			QueueUrl:                    aws.String("example-1-url"),
 			WaitTimeSeconds:             8,
 			MaxNumberOfMessages:         15,
+			VisibilityTimeout:           12,
 			MessageAttributeNames:       []string{"All"},
 			MessageSystemAttributeNames: []types.MessageSystemAttributeName{types.MessageSystemAttributeNameAll},
 		}
@@ -331,25 +322,24 @@ func (suite *routeSuite) TestHandlerMessage() {
 			}, nil).
 			Once()
 
-		suite.sqsClient.On("ChangeMessageVisibility", ctx, &awsSqs.ChangeMessageVisibilityInput{
-			QueueUrl:          aws.String("example-1-url"),
-			ReceiptHandle:     aws.String("receipt-handle"),
-			VisibilityTimeout: int32(12),
-		}).Return(nil, nil).Once()
-
 		message, err := suite.route.GetMessages(ctx, logger)
 		suite.NoError(err)
-		suite.NoError(err)
-
-		<-done
 
 		err = suite.route.HandlerMessage(ctx, message[0])
 		suite.Nil(err)
+
+		// commit to dispatch the message, otherwise its changeMessageVisibility
+		// goroutine keeps ticking in the background for the rest of the test run.
+		suite.sqsClient.On("DeleteMessage", ctx, &awsSqs.DeleteMessageInput{
+			QueueUrl:      aws.String("example-1-url"),
+			ReceiptHandle: aws.String("receipt-handle"),
+		}).Return(nil, nil).Once()
+		suite.NoError(suite.route.Commit(ctx, message[0]))
 	})
 
 	suite.Run("should return error when handler message error", func() {
 		suite.route = suite.setupRouter()
-		ctx, done := setupContext(1)
+		ctx := context.Background()
 		cParam := &awsSqs.GetQueueUrlInput{QueueName: aws.String("example-1")}
 		suite.sqsClient.On("GetQueueUrl", ctx, cParam).
 			Return(&awsSqs.GetQueueUrlOutput{QueueUrl: aws.String("example-1-url")}, nil).
@@ -361,6 +351,7 @@ func (suite *routeSuite) TestHandlerMessage() {
 			QueueUrl:                    aws.String("example-1-url"),
 			WaitTimeSeconds:             8,
 			MaxNumberOfMessages:         15,
+			VisibilityTimeout:           12,
 			MessageAttributeNames:       []string{"All"},
 			MessageSystemAttributeNames: []types.MessageSystemAttributeName{types.MessageSystemAttributeNameAll},
 		}
@@ -373,16 +364,8 @@ func (suite *routeSuite) TestHandlerMessage() {
 			}, nil).
 			Once()
 
-		suite.sqsClient.On("ChangeMessageVisibility", ctx, &awsSqs.ChangeMessageVisibilityInput{
-			QueueUrl:          aws.String("example-1-url"),
-			ReceiptHandle:     aws.String("receipt-handle"),
-			VisibilityTimeout: int32(12),
-		}).Return(nil, nil).Once()
-
 		message, err := suite.route.GetMessages(ctx, logger)
 		suite.NoError(err)
-
-		<-done
 
 		suite.route = sqs.NewRoute(&sqs.Config{
 			SQSClient: suite.sqsClient,
@@ -469,10 +452,13 @@ func (suite *routeSuite) TestChangeVisibilityInitially() {
 	logger := new(fake.Logger)
 	logger.On("Log", mock.Anything).Return()
 
-	suite.Run("should change visibility timeout initially", func() {
+	suite.Run("should not change visibility timeout when the message is handled quickly", func() {
 		visibilityTimeout := 30
-		suite.route = sqs.NewRoute(&sqs.Config{
-			SQSClient: suite.sqsClient,
+		// isolated mock: we assert ChangeMessageVisibility is never called, so this must
+		// not share call history with other subtests in the suite.
+		sqsClient := fake.NewSQSClient(suite.T())
+		route := sqs.NewRoute(&sqs.Config{
+			SQSClient: sqsClient,
 			Handler: func(ctx context.Context, m loafergo.Message) error {
 				return nil
 			},
@@ -483,29 +469,30 @@ func (suite *routeSuite) TestChangeVisibilityInitially() {
 			sqs.RouteWithWaitTimeSeconds(10),
 		)
 
-		ctx, done := setupContext(1)
+		ctx := context.Background()
 
-		visibilityTimeout = int(suite.route.VisibilityTimeout(ctx))
+		visibilityTimeout = int(route.VisibilityTimeout(ctx))
 
 		receiptHandle := aws.String("receipt-handle")
 		queueUrl := aws.String("example-1-url")
 
 		cParam := &awsSqs.GetQueueUrlInput{QueueName: aws.String("example-1")}
-		suite.sqsClient.On("GetQueueUrl", ctx, cParam).
+		sqsClient.On("GetQueueUrl", ctx, cParam).
 			Return(&awsSqs.GetQueueUrlOutput{QueueUrl: queueUrl}, nil).
 			Once()
 
-		err := suite.route.Configure(ctx)
+		err := route.Configure(ctx)
 		suite.NoError(err)
 		param := &awsSqs.ReceiveMessageInput{
 			QueueUrl:                    queueUrl,
 			WaitTimeSeconds:             10,
 			MaxNumberOfMessages:         10,
+			VisibilityTimeout:           int32(visibilityTimeout),
 			MessageAttributeNames:       []string{"All"},
 			MessageSystemAttributeNames: []types.MessageSystemAttributeName{types.MessageSystemAttributeNameAll},
 		}
 
-		suite.sqsClient.On("ReceiveMessage", ctx, param).
+		sqsClient.On("ReceiveMessage", ctx, param).
 			Return(&awsSqs.ReceiveMessageOutput{
 				Messages: []types.Message{{
 					Body:          aws.String("hello world"),
@@ -514,29 +501,23 @@ func (suite *routeSuite) TestChangeVisibilityInitially() {
 			}, nil).
 			Once()
 
-		suite.sqsClient.On("ChangeMessageVisibility", ctx, &awsSqs.ChangeMessageVisibilityInput{
-			QueueUrl:          queueUrl,
-			ReceiptHandle:     receiptHandle,
-			VisibilityTimeout: int32(visibilityTimeout),
-		}).Return(nil, nil).Once()
-
-		messages, err := suite.route.GetMessages(ctx, logger)
+		messages, err := route.GetMessages(ctx, logger)
 		suite.NoError(err)
-
-		<-done
 
 		msg := messages[0]
 
-		err = suite.route.HandlerMessage(ctx, msg)
+		err = route.HandlerMessage(ctx, msg)
 		suite.Nil(err)
 
-		suite.sqsClient.On("DeleteMessage", ctx, &awsSqs.DeleteMessageInput{
+		sqsClient.On("DeleteMessage", ctx, &awsSqs.DeleteMessageInput{
 			QueueUrl:      queueUrl,
 			ReceiptHandle: receiptHandle,
 		}).Return(nil, nil).Once()
 
-		err = suite.route.Commit(ctx, msg)
+		err = route.Commit(ctx, msg)
 		suite.Nil(err)
+
+		sqsClient.AssertNotCalled(suite.T(), "ChangeMessageVisibility")
 	})
 
 }
@@ -578,6 +559,7 @@ func (suite *routeSuite) TestChangeVisibilityTimeout() {
 			QueueUrl:                    queueUrl,
 			WaitTimeSeconds:             10,
 			MaxNumberOfMessages:         10,
+			VisibilityTimeout:           int32(visibilityTimeout),
 			MessageAttributeNames:       []string{"All"},
 			MessageSystemAttributeNames: []types.MessageSystemAttributeName{types.MessageSystemAttributeNameAll},
 		}
@@ -628,7 +610,7 @@ func (suite *routeSuite) TestBackoff() {
 	logger := new(fake.Logger)
 	logger.On("Log", mock.Anything).Return()
 
-	suite.Run("should change visibility timeout initially and when backoff is called", func() {
+	suite.Run("should change visibility timeout when backoff is called", func() {
 		visibilityTimeout := 30
 		backoffTimeout := 10
 
@@ -645,7 +627,7 @@ func (suite *routeSuite) TestBackoff() {
 			sqs.RouteWithWaitTimeSeconds(10),
 		)
 
-		ctx, done := setupContext(2)
+		ctx, done := setupContext(1)
 
 		visibilityTimeout = int(suite.route.VisibilityTimeout(ctx))
 
@@ -663,6 +645,7 @@ func (suite *routeSuite) TestBackoff() {
 			QueueUrl:                    queueUrl,
 			WaitTimeSeconds:             10,
 			MaxNumberOfMessages:         10,
+			VisibilityTimeout:           int32(visibilityTimeout),
 			MessageAttributeNames:       []string{"All"},
 			MessageSystemAttributeNames: []types.MessageSystemAttributeName{types.MessageSystemAttributeNameAll},
 		}
@@ -676,12 +659,8 @@ func (suite *routeSuite) TestBackoff() {
 			}, nil).
 			Once()
 
-		suite.sqsClient.On("ChangeMessageVisibility", ctx, &awsSqs.ChangeMessageVisibilityInput{
-			QueueUrl:          queueUrl,
-			ReceiptHandle:     receiptHandle,
-			VisibilityTimeout: int32(visibilityTimeout),
-		}).Return(nil, nil).Once()
-
+		// Backoff overrides visibility immediately regardless of ticker timing, so this
+		// is the only ChangeMessageVisibility call expected here.
 		suite.sqsClient.On("ChangeMessageVisibility", ctx, &awsSqs.ChangeMessageVisibilityInput{
 			QueueUrl:          queueUrl,
 			ReceiptHandle:     receiptHandle,

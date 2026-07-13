@@ -99,6 +99,7 @@ func (r *route) GetMessages(ctx context.Context, logger loafergo.Logger) (messag
 			QueueUrl:                    &r.queueURL,
 			WaitTimeSeconds:             r.waitTimeSeconds,
 			MaxNumberOfMessages:         r.maxMessages,
+			VisibilityTimeout:           r.visibilityTimeout,
 			MessageAttributeNames:       []string{all},
 			MessageSystemAttributeNames: []types.MessageSystemAttributeName{types.MessageSystemAttributeNameAll},
 		},
@@ -166,6 +167,10 @@ func (r *route) CustomGroupFields(ctx context.Context) []string {
 	return r.customGroupFields
 }
 
+// changeMessageVisibility only extends the message visibility timeout when processing
+// is still ongoing after it. Since ReceiveMessage already requests VisibilityTimeout
+// equal to r.visibilityTimeout, messages committed or dispatched before the first tick
+// never trigger a ChangeMessageVisibility call.
 func (r *route) changeMessageVisibility(ctx context.Context, m *message, logger loafergo.Logger) {
 	var count int
 	extension := r.visibilityTimeout
@@ -173,12 +178,10 @@ func (r *route) changeMessageVisibility(ctx context.Context, m *message, logger 
 	ticker := time.NewTicker(sleepTime)
 	defer ticker.Stop()
 
-	r.doChangeVisibilityTimeout(ctx, m, extension, logger)
-
 	for {
-		// only allow extensionLimit extension (Default 1m30s)
-		if count >= r.extensionLimit {
-			break
+		// only allow extensionLimit extension (Default 1m30s) beyond the first renewal
+		if count > r.extensionLimit {
+			return
 		}
 
 		select {
@@ -188,10 +191,12 @@ func (r *route) changeMessageVisibility(ctx context.Context, m *message, logger 
 		case <-m.dispatched:
 			return
 		case <-ticker.C:
-			count++
-			// double the allowed processing time
-			extension += r.visibilityTimeout
+			// the first tick just renews the original timeout, subsequent ticks double it
+			if count > 0 {
+				extension += r.visibilityTimeout
+			}
 			r.doChangeVisibilityTimeout(ctx, m, extension, logger)
+			count++
 		}
 	}
 }
