@@ -79,3 +79,12 @@ check: lint test
 test-bench:
 	@$(MAKE) -s clean
 	@go test -bench=. ./... -benchtime=5s -count 1 -benchmem
+
+# Run integration tests against a real LocalStack SQS queue
+test-integration:
+	@echo "Starting LocalStack..."
+	@docker compose -f docker-compose.integration.yml up -d
+	@echo "Waiting for LocalStack to be ready..."
+	@until curl -s http://localhost:4566/_localstack/health | grep -q '"sqs": "\(running\|available\)"'; do sleep 1; done
+	@go test -tags=integration -race -v ./aws/sqs/... -run Integration || (docker compose -f docker-compose.integration.yml down -v && exit 1)
+	@docker compose -f docker-compose.integration.yml down -v
