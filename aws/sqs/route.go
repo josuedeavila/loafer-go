@@ -3,6 +3,9 @@ package sqs
 import (
 	"context"
 	"fmt"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
@@ -14,20 +17,30 @@ import (
 const (
 	all                             = "All"
 	defaultVisibilityTimeoutControl = 10
+	fifoQueueSuffix                 = ".fifo"
+	// fifoLingerWarn is the linger above which batching deletes starts to noticeably
+	// throttle a single FIFO message group.
+	fifoLingerWarn = 100 * time.Millisecond
 )
 
 type route struct {
-	sqs               loafergo.SQSClient
-	handler           loafergo.Handler
-	queueName         string
-	queueURL          string
-	customGroupFields []string
-	extensionLimit    int
-	runMode           loafergo.Mode
-	visibilityTimeout int32
-	maxMessages       int32
-	waitTimeSeconds   int32
-	workerPoolSize    int32
+	sqs                loafergo.SQSClient
+	handler            loafergo.Handler
+	logger             loafergo.Logger
+	batcher            *deleteBatcher
+	queueName          string
+	queueURL           string
+	customGroupFields  []string
+	extensionLimit     int
+	deleteLinger       time.Duration
+	runMode            loafergo.Mode
+	inFlight           atomic.Int64
+	batcherOnce        sync.Once
+	visibilityTimeout  int32
+	maxMessages        int32
+	waitTimeSeconds    int32
+	workerPoolSize     int32
+	deleteBatchEnabled bool
 }
 
 // DoneCtxKey is the context key for the done channel that is optionally passed to the router
@@ -62,16 +75,19 @@ func NewRoute(config *Config, optFns ...func(config *RouteConfig)) loafergo.Rout
 	}
 
 	return &route{
-		sqs:               config.SQSClient,
-		handler:           config.Handler,
-		queueName:         config.QueueName,
-		extensionLimit:    cfg.extensionLimit,
-		visibilityTimeout: cfg.visibilityTimeout,
-		maxMessages:       cfg.maxMessages,
-		waitTimeSeconds:   cfg.waitTimeSeconds,
-		workerPoolSize:    cfg.workerPoolSize,
-		runMode:           cfg.runMode,
-		customGroupFields: cfg.customGroupFields,
+		sqs:                config.SQSClient,
+		handler:            config.Handler,
+		logger:             cfg.logger,
+		queueName:          config.QueueName,
+		extensionLimit:     cfg.extensionLimit,
+		visibilityTimeout:  cfg.visibilityTimeout,
+		maxMessages:        cfg.maxMessages,
+		waitTimeSeconds:    cfg.waitTimeSeconds,
+		workerPoolSize:     cfg.workerPoolSize,
+		runMode:            cfg.runMode,
+		customGroupFields:  cfg.customGroupFields,
+		deleteBatchEnabled: cfg.deleteBatchEnabled,
+		deleteLinger:       clampDeleteLinger(cfg.deleteLinger, cfg.visibilityTimeout),
 	}
 }
 
@@ -88,7 +104,33 @@ func (r *route) Configure(ctx context.Context) error {
 	}
 
 	r.queueURL = *o.QueueUrl
+	r.startDeleteBatcher(ctx)
 	return nil
+}
+
+// startDeleteBatcher spins up the delete batcher, which lives for as long as ctx does.
+// It is a no-op unless RouteWithDeleteBatch was used, which keeps the default route on the
+// original one-delete-per-message path.
+func (r *route) startDeleteBatcher(ctx context.Context) {
+	if !r.deleteBatchEnabled {
+		return
+	}
+
+	r.batcherOnce.Do(func() {
+		if strings.HasSuffix(r.queueName, fifoQueueSuffix) && r.deleteLinger > fifoLingerWarn {
+			r.logger.Log(fmt.Sprintf(
+				"delete_batch_fifo_warning: a linger of %s delays the next message of every message group; queue: %s",
+				r.deleteLinger, r.queueName,
+			))
+		}
+
+		// The buffer holds every message that can be alive at once: a full receive batch
+		// plus one in-flight Commit per worker, plus one batch worth of headroom.
+		capacity := int(r.maxMessages) + int(r.workerPoolSize) + maxDeleteBatchSize
+		b := newDeleteBatcher(r.sqs, r.logger, r.queueURL, r.deleteLinger, capacity)
+		r.batcher = b
+		go b.run(ctx)
+	})
 }
 
 // GetMessages gets messages from queue
@@ -108,6 +150,8 @@ func (r *route) GetMessages(ctx context.Context, logger loafergo.Logger) (messag
 		return
 	}
 
+	r.inFlight.Add(int64(len(output.Messages)))
+
 	for _, m := range output.Messages {
 		msg := newMessage(m)
 		messages = append(messages, msg)
@@ -118,23 +162,53 @@ func (r *route) GetMessages(ctx context.Context, logger loafergo.Logger) (messag
 	return
 }
 
-// Commit deletes the message from the queue
+// Commit deletes the message from the queue.
+//
+// When the route was built with RouteWithDeleteBatch the message is handed to the delete
+// batcher and Commit returns nil immediately, without blocking the worker - the delete
+// outcome is logged by the batcher instead of being returned here.
 func (r *route) Commit(ctx context.Context, m loafergo.Message) error {
 	// if the handler backed off the message, we should not delete it
 	if m.BackedOff() {
+		if r.messageDone() && r.batcher != nil {
+			r.batcher.poke()
+		}
 		return nil
 	}
 
+	if b := r.batcher; b != nil {
+		last := r.messageDone()
+		if b.enqueue(deleteItem{msg: m, flush: last}) {
+			return nil
+		}
+		// The batcher is shutting down or saturated: keep the delete synchronous rather
+		// than dropping it or blocking the worker.
+		if last {
+			b.poke()
+		}
+		return r.deleteMessage(ctx, m)
+	}
+
+	r.messageDone()
+	return r.deleteMessage(ctx, m)
+}
+
+// deleteMessage removes a single message from the queue.
+func (r *route) deleteMessage(ctx context.Context, m loafergo.Message) error {
 	defer m.Dispatch()
 	identifier := m.Identifier()
 	_, err := r.sqs.DeleteMessage(
 		ctx,
 		&sqs.DeleteMessageInput{QueueUrl: &r.queueURL, ReceiptHandle: &identifier},
 	)
-	if err != nil {
-		return err
-	}
 	return err
+}
+
+// messageDone accounts for one message leaving the route - committed, backed off or failed
+// in the handler - and reports whether it was the last one of the current receive cycle.
+// That is the signal the batcher uses to flush without waiting for the linger.
+func (r *route) messageDone() bool {
+	return r.inFlight.Add(-1) <= 0
 }
 
 // HandlerMessage consumes the message from the queue
@@ -142,6 +216,9 @@ func (r *route) HandlerMessage(ctx context.Context, msg loafergo.Message) error 
 	err := r.handler(ctx, msg)
 	if err != nil {
 		msg.Dispatch()
+		if r.messageDone() && r.batcher != nil {
+			r.batcher.poke()
+		}
 		return err
 	}
 	return nil

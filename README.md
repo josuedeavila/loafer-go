@@ -12,6 +12,7 @@ Loafer Go is a lightweight Go library designed for high-throughput and concurren
   - Parallel (loafergo.Parallel)
 - ✅ **SNS Producer** with support for both standard and FIFO topics
 - ✅ **SQS Batch Receive and Parallel Handling**
+- ✅ **Batched Deletes** (`sqs.RouteWithDeleteBatch`) — up to 10x fewer delete API calls
 - ✅ **Simple API** with clean abstractions and interfaces
 - ✅ **Test Coverage & Benchmarks**
 - ✅ **Fully Configurable** via functional options
@@ -100,6 +101,40 @@ BenchmarkStructToMapWithCache-12                 6046621              1025 ns/op
 
 ---
 
+## 🗑️ Batched Deletes
+
+By default each consumed message costs one `DeleteMessage` call. `sqs.RouteWithDeleteBatch`
+groups them into `DeleteMessageBatch` requests of up to 10 entries — the same ceiling as
+`MaxNumberOfMessages` — so a full receive cycle collapses into a single delete call:
+
+```go
+route := sqs.NewRoute(
+    &sqs.Config{SQSClient: client, Handler: handler, QueueName: "example-1"},
+    sqs.RouteWithMaxMessages(10),
+    sqs.RouteWithDeleteBatch(50*time.Millisecond),
+    sqs.RouteWithLogger(logger), // where delete failures are reported
+)
+```
+
+A batch is flushed as soon as it holds 10 messages **or** the last message of the current
+receive cycle is committed, so in the common case no latency is added at all. The linger is
+only the safety net for when a slow handler holds the batch back. Measured against
+LocalStack with 100 messages: 100 `DeleteMessage` calls become 10 `DeleteMessageBatch`
+calls, and a FIFO run of 60 messages across 4 groups got *faster* (528ms → 322ms), since
+workers no longer block on a delete round trip.
+
+Two things to know before enabling it:
+
+- **`Commit` becomes asynchronous.** It hands the message to the batcher and returns `nil`
+  immediately, so the delete outcome is reported through the route logger instead of being
+  returned to the manager.
+- **Handlers must be idempotent.** A delete still pending when the process dies means the
+  message is redelivered — which is already true of SQS at-least-once delivery, but the
+  window is slightly wider. On FIFO queues keep the linger small: SQS will not deliver the
+  next message of a `MessageGroupId` while one is still in flight.
+
+---
+
 ## 📌 Makefile Tasks
 
 ```makefile
@@ -111,6 +146,8 @@ make install-goimports       # Install GoImports
 make clean                   # Clean test cache
 make test                    # Run tests with coverage
 make test-bench              # Run benchmarks
+make test-integration        # Run integration tests against LocalStack
+make generate                # Regenerate the mocks in fake/
 ```
 
 ---

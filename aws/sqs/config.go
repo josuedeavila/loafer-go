@@ -2,6 +2,7 @@ package sqs
 
 import (
 	"strconv"
+	"time"
 
 	loafergo "github.com/justcodes/loafer-go/v2"
 )
@@ -19,17 +20,23 @@ const (
 	defaultMaxMessages       = int32(10)
 	defaultWaitTimeSeconds   = int32(10)
 	defaultWorkerPoolSize    = int32(5)
+	// deleteLingerVisibilityDivisor keeps the delete linger to a fraction of the route
+	// visibility timeout, so a pending batch never eats the watchdog renewal budget.
+	deleteLingerVisibilityDivisor = 4
 )
 
 // RouteConfig are a discrete set of route options that are valid for loading the route configuration
 type RouteConfig struct {
-	customGroupFields []string
-	extensionLimit    int
-	runMode           loafergo.Mode
-	visibilityTimeout int32
-	maxMessages       int32
-	waitTimeSeconds   int32
-	workerPoolSize    int32
+	logger             loafergo.Logger
+	customGroupFields  []string
+	extensionLimit     int
+	deleteLinger       time.Duration
+	runMode            loafergo.Mode
+	visibilityTimeout  int32
+	maxMessages        int32
+	waitTimeSeconds    int32
+	workerPoolSize     int32
+	deleteBatchEnabled bool
 }
 
 func loadDefaultRouteConfig() *RouteConfig {
@@ -40,7 +47,28 @@ func loadDefaultRouteConfig() *RouteConfig {
 		waitTimeSeconds:   defaultWaitTimeSeconds,
 		workerPoolSize:    defaultWorkerPoolSize,
 		runMode:           loafergo.Parallel,
+		logger:            loafergo.NoOpLogger{},
 	}
+}
+
+// clampDeleteLinger bounds the configured linger to a safe window: never so short that it
+// defeats the batching, never long enough to compromise the visibility timeout budget the
+// watchdog works with, nor to stall a FIFO message group for a noticeable time.
+func clampDeleteLinger(linger time.Duration, visibilityTimeout int32) time.Duration {
+	if linger <= 0 {
+		linger = defaultDeleteLinger
+	}
+	if linger < minDeleteLinger {
+		linger = minDeleteLinger
+	}
+	if linger > maxDeleteLinger {
+		linger = maxDeleteLinger
+	}
+	budget := time.Duration(visibilityTimeout) * time.Second / deleteLingerVisibilityDivisor
+	if linger > budget {
+		linger = budget
+	}
+	return linger
 }
 
 // LoadRouteConfigFunc is a type alias for RouteConfig functional config
@@ -143,6 +171,45 @@ func RouteWithRunMode(v loafergo.Mode) LoadRouteConfigFunc {
 func RouteWithCustomGroupFields(v []string) LoadRouteConfigFunc {
 	return func(rc *RouteConfig) {
 		rc.customGroupFields = v
+	}
+}
+
+// RouteWithDeleteBatch enables grouping message deletions into DeleteMessageBatch calls,
+// cutting the number of delete API calls by up to 10x.
+//
+// With it enabled Commit becomes asynchronous: it hands the message over to the batcher
+// and returns nil right away, so workers never block waiting on a delete. The outcome of
+// the delete is reported through the logger set with RouteWithLogger.
+//
+// A batch is flushed as soon as it holds 10 messages - the AWS limit, which matches the
+// MaxNumberOfMessages ceiling - or as soon as the last message of a receive cycle is
+// committed. In the common case that means one DeleteMessageBatch per ReceiveMessage with
+// no added latency at all; linger is only the safety net for when a slow handler is
+// holding the batch back.
+//
+// A non positive linger falls back to 50ms. The value is clamped to [10ms, 5s] and to a
+// quarter of the route visibility timeout.
+//
+// On FIFO queues a delayed delete holds the whole MessageGroupId, since SQS does not
+// deliver the next message of a group while one is still in flight. Keep the linger small
+// there, and note that handlers must be idempotent: a delete pending at crash time means
+// the message is redelivered.
+func RouteWithDeleteBatch(linger time.Duration) LoadRouteConfigFunc {
+	return func(rc *RouteConfig) {
+		rc.deleteBatchEnabled = true
+		rc.deleteLinger = linger
+	}
+}
+
+// RouteWithLogger sets the logger the route uses to report delete batch failures.
+// It defaults to loafergo.NoOpLogger, and normally receives the same logger given to the
+// loafergo.Config driving the manager. A nil logger is ignored.
+func RouteWithLogger(l loafergo.Logger) LoadRouteConfigFunc {
+	return func(rc *RouteConfig) {
+		if l == nil {
+			return
+		}
+		rc.logger = l
 	}
 }
 
