@@ -21,6 +21,9 @@ const (
 	// fifoLingerWarn is the linger above which batching deletes starts to noticeably
 	// throttle a single FIFO message group.
 	fifoLingerWarn = 100 * time.Millisecond
+	// deleteBufferHeadroom multiplies the delete buffer so a flush in flight does not
+	// push Commit onto the single delete fallback.
+	deleteBufferHeadroom = 4
 )
 
 type route struct {
@@ -124,9 +127,12 @@ func (r *route) startDeleteBatcher(ctx context.Context) {
 			))
 		}
 
-		// The buffer holds every message that can be alive at once: a full receive batch
-		// plus one in-flight Commit per worker, plus one batch worth of headroom.
-		capacity := int(r.maxMessages) + int(r.workerPoolSize) + maxDeleteBatchSize
+		// The buffer has to absorb everything the route hands over while the flusher is
+		// blocked on a delete round trip, which is more than one receive batch plus one
+		// in-flight Commit per worker. Benchmarking 2000 messages showed a buffer that
+		// size saturating and falling back to single deletes; the headroom below removes
+		// it, and costs only a few hundred pointers.
+		capacity := deleteBufferHeadroom * (int(r.maxMessages) + int(r.workerPoolSize) + maxDeleteBatchSize)
 		b := newDeleteBatcher(r.sqs, r.logger, r.queueURL, r.deleteLinger, capacity)
 		r.batcher = b
 		go b.run(ctx)
