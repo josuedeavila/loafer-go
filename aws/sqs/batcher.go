@@ -125,6 +125,10 @@ func (b *deleteBatcher) run(ctx context.Context) {
 				batch = batch[:0]
 			}
 		case <-b.pokeCh:
+			// A poke means the route has nothing left in flight, so anything already
+			// queued belongs to this flush. Without the drain it would race with the
+			// send and sit waiting for the linger instead.
+			batch = b.drainInto(batch)
 			b.flushPending(ctx, batch)
 			batch = batch[:0]
 		case <-timer.C:
@@ -153,14 +157,7 @@ func (b *deleteBatcher) shutdown(ctx context.Context, batch []loafergo.Message) 
 
 	// Every enqueue either observed closed and fell back to a single delete, or already
 	// landed in the buffer and is picked up here. There is no third case.
-	for draining := true; draining; {
-		select {
-		case it := <-b.in:
-			batch = append(batch, it.msg)
-		default:
-			draining = false
-		}
-	}
+	batch = b.drainInto(batch)
 
 	if len(batch) == 0 {
 		return
@@ -169,6 +166,18 @@ func (b *deleteBatcher) shutdown(ctx context.Context, batch []loafergo.Message) 
 	flushCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownFlushTimeout)
 	defer cancel()
 	b.flushPending(flushCtx, batch)
+}
+
+// drainInto moves every message already queued into batch, without blocking.
+func (b *deleteBatcher) drainInto(batch []loafergo.Message) []loafergo.Message {
+	for {
+		select {
+		case it := <-b.in:
+			batch = append(batch, it.msg)
+		default:
+			return batch
+		}
+	}
 }
 
 // flushPending deletes every pending message, splitting it into requests of at most

@@ -372,6 +372,45 @@ func TestDeleteBatcher_EnqueueRefusesWhenSaturatedWithoutBlocking(t *testing.T) 
 	}
 }
 
+// A poke races with the message that was enqueued just before it: if the run loop picks
+// pokeCh first it would flush an empty batch and leave the message waiting for the linger,
+// which on a FIFO queue is exactly the latency the in-flight trigger exists to remove.
+// Seeding both channels before the loop starts makes the two orderings equally likely, and
+// the batch must go out whole either way.
+func TestDeleteBatcher_PokeDrainsMessagesStillInFlight(t *testing.T) {
+	const pending = 3
+
+	for i := 0; i < 30; i++ {
+		client := new(fake.SQSClient)
+		batches := make(chan int, 8)
+		client.On("DeleteMessageBatch", mock.Anything, mock.Anything).Return(
+			func(_ context.Context, in *awsSqs.DeleteMessageBatchInput,
+				_ ...func(*awsSqs.Options)) (*awsSqs.DeleteMessageBatchOutput, error) {
+				batches <- len(in.Entries)
+				return allSuccessful(in), nil
+			})
+
+		// an hour of linger: a message left behind by the poke would never be flushed
+		b := newDeleteBatcher(client, loafergo.NoOpLogger{}, testQueueURL, time.Hour, 8)
+		for j := 0; j < pending; j++ {
+			require.True(t, b.enqueue(deleteItem{msg: testMessage("handle-a")}))
+		}
+		b.poke()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		go b.run(ctx)
+
+		select {
+		case n := <-batches:
+			require.Equal(t, pending, n, "the poke must take the queued messages with it")
+		case <-time.After(2 * time.Second):
+			t.Fatal("the poke flushed without draining the messages still queued")
+		}
+		cancel()
+		<-b.done
+	}
+}
+
 func TestDeleteBatcher_PokeWithNothingPendingIsANoop(t *testing.T) {
 	h := newHarness(t, time.Hour, 32, succeedAll)
 
